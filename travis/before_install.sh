@@ -35,6 +35,7 @@ elif [ "$TRAVIS_OS_NAME" == "osx" ]; then
   brew unlink python
   if [ "${PYTHON_VERSION}" == "python3" ]; then
     brew install ccache protobuf
+    brew unlink python # If you have installed (with brew) another version of python, https://stackoverflow.com/questions/51125013/how-can-i-install-a-previous-version-of-python-3-in-macos-using-homebrew
     brew install https://raw.githubusercontent.com/Homebrew/homebrew-core/f2a764ef944b1080be64bd88dca9a1d80130c558/Formula/python.rb
   elif [ "${PYTHON_VERSION}" == "python2" ]; then
     brew install ccache protobuf ${PYTHON_VERSION}
