@@ -24,12 +24,14 @@ from ._transformers import ConvAddFuser, DropoutRemover, \
     PixelShuffleFuser, OutputRenamer, AddModelInputsOutputs, \
     ConstantsToInitializers, ImageScalerRemover, UnsqueezeConstantRemover, TransposeConstantRemover, \
     ShapeOpRemover, SliceConstantRemover, ConcatConstantRemover, DivMulConstantRemover, GatherConstantRemover, \
-    ConstantFillToInitializers
+    ConstantFillToInitializers, ReshapeTransposeReshape_pattern1
 
 from ._error_utils import ErrorHandling
 from .graph_viz import plot_graph # type: ignore
 
 USE_SHAPE_MAPPING = True
+
+DEBUG = False
 
 '''
 inputs: list of tuples.
@@ -280,9 +282,11 @@ def _set_deprocessing(is_grayscale,  # type: bool
 
 def _prepare_onnx_graph(graph, transformers):  # type: (Graph, Iterable[Transformer]) -> Graph
     graph_ = Graph.from_onnx(graph)
-    #plot_graph(graph_, graph_img_path='/tmp/graph_raw.png')
+    if DEBUG:
+        plot_graph(graph_, graph_img_path='/tmp/graph_raw.pdf')
     graph_ = graph_.transformed(transformers)
-    #plot_graph(graph_, graph_img_path='/tmp/graph_opt.png')
+    if DEBUG:
+        plot_graph(graph_, graph_img_path='/tmp/graph_opt.pdf')
     return graph_
 
 def convert(model,  # type: Union[onnx.ModelProto, Text]
@@ -359,6 +363,7 @@ def convert(model,  # type: Union[onnx.ModelProto, Text]
         ConvAddFuser(),
         BNBroadcastedMulFuser(),
         BNBroadcastedAddFuser(),
+        ReshapeTransposeReshape_pattern1(),
         PixelShuffleFuser(),
         AddModelInputsOutputs(),
         DivMulConstantRemover(),
@@ -457,12 +462,14 @@ def convert(model,  # type: Union[onnx.ModelProto, Text]
     err = ErrorHandling(add_custom_layers,
                         custom_conversion_functions)
 
-    #plot_graph(graph, graph_img_path='/tmp/before_conversion.pdf')
+
     for i, node in enumerate(graph.nodes):
         print("%d/%d: Converting Node Type %s" %(i+1, len(graph.nodes), node.op_type))
         _add_const_inputs_if_required(builder, node, graph, err)
         _convert_node(builder, node, graph, err)
-    #plot_graph(graph, graph_img_path='/tmp/after_conversion.pdf', show_coreml_mapped_shapes=True)
+
+    if DEBUG:
+        plot_graph(graph, graph_img_path='/tmp/after_conversion.pdf', show_coreml_mapped_shapes=True)
 
 
     if add_deprocess:
@@ -501,43 +508,69 @@ def convert(model,  # type: Union[onnx.ModelProto, Text]
             predicted_feature_name=predicted_feature_name
         )
 
-    # add description to inputs/outputs that feed in/out of recurrent layers
-    for node_ in graph.nodes:
-        if str(node_.op_type) in _SEQUENCE_LAYERS_REGISTRY:
-            input_ = node_.inputs[0]
-            output_ = node_.outputs[0]
-            for i, inputs in enumerate(builder.spec.description.input):
-                if inputs.name == input_:
-                    builder.spec.description.input[i].shortDescription = 'This input is a sequence. '
-            for i, outputs in enumerate(builder.spec.description.output):
-                if outputs.name == output_:
-                    builder.spec.description.output[i].shortDescription = 'This output is a sequence. '
+    # # add description to inputs/outputs that feed in/out of recurrent layers
+    # for node_ in graph.nodes:
+    #     if str(node_.op_type) in _SEQUENCE_LAYERS_REGISTRY:
+    #         input_ = node_.inputs[0]
+    #         output_ = node_.outputs[0]
+    #         for i, inputs in enumerate(builder.spec.description.input):
+    #             if inputs.name == input_:
+    #                 builder.spec.description.input[i].shortDescription = 'This input is a sequence. '
+    #         for i, outputs in enumerate(builder.spec.description.output):
+    #             if outputs.name == output_:
+    #                 builder.spec.description.output[i].shortDescription = 'This output is a sequence. '
 
-    def _add_informative_description(feature):
+    def _add_informative_description(feature, raise_error=True):
         if feature.type.WhichOneof('Type') == 'multiArrayType':
             if feature.name in graph.onnx_coreml_shape_mapping and feature.name in graph.shape_dict:
                 mapp = graph.onnx_coreml_shape_mapping[feature.name]
                 onnx_shape = graph.shape_dict[feature.name]
-                assert len(mapp) == len(onnx_shape), "Something wrong in shape"
-                shape = []
-                for i in range(5):
-                    if i in mapp:
-                        shape += [int(onnx_shape[mapp.index(i)])]
-                    else:
-                        shape += [1]
-                msg = 'MultiArray of shape {}. The first and second dimensions correspond to sequence and batch size, respectively'.format(str(tuple(shape)))
-                feature.shortDescription += msg
+                if raise_error: assert len(mapp) == len(onnx_shape), "Something wrong in shape"
+                if len(mapp) == len(onnx_shape):
+                    shape = []
+                    for i in range(5):
+                        if i in mapp:
+                            shape += [int(onnx_shape[mapp.index(i)])]
+                        else:
+                            shape += [1]
+                    msg = 'MultiArray of shape {}. The first and second dimensions correspond to sequence and batch size, respectively'.format(str(tuple(shape)))
+                    feature.shortDescription += msg
+
+    optional_input_names = []
+    for tup in graph.optional_inputs:
+        optional_input_names.append(tup[0])
+    optional_output_names = []
+    for tup in graph.optional_outputs:
+        optional_output_names.append(tup[0])
 
     # add description for inputs and outputs shapes
-    for input_ in builder.spec.description.input:
-        _add_informative_description(input_)
-    for output_ in builder.spec.description.output:
-        _add_informative_description(output_)
+    remove_input_id = []
+    for i, input_ in enumerate(builder.spec.description.input):
+        if input_.name not in optional_input_names:
+            _add_informative_description(input_)
+        else:
+            remove_input_id.append(i)
+    remove_output_id = []
+    for i, output_ in enumerate(builder.spec.description.output):
+        if output_.name not in optional_output_names:
+            _add_informative_description(output_, raise_error=False)
+        else:
+            remove_output_id.append(i)
+
+    for index in sorted(remove_input_id, reverse=True):
+        del builder.spec.description.input[index]
+    for index in sorted(remove_output_id, reverse=True):
+        del builder.spec.description.output[index]
+
+
+    if len(graph.optional_inputs) > 0 or len(graph.optional_outputs):
+        builder.add_optionals(graph.optional_inputs, graph.optional_outputs)
 
     print("Translation to CoreML spec completed. Now compiling the CoreML model.")
     try:
-        #import coremltools
-        #coremltools.models.utils.save_spec(builder.spec, '/tmp/node_model.mlmodel')
+        if DEBUG:
+            import coremltools
+            coremltools.models.utils.save_spec(builder.spec, '/tmp/node_model_raw_spec.mlmodel')
         mlmodel = MLModel(builder.spec)
     except RuntimeError as e:
         raise ValueError('Compilation failed: {}'.format(str(e)))
